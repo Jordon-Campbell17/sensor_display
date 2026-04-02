@@ -17,6 +17,8 @@
 #include <DHT.h>
 #include <Adafruit_BMP280.h>
 #include <Wire.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
 #include <Fonts/FreeSansBold9pt7b.h>
 #include <Fonts/FreeSansBold12pt7b.h>
 
@@ -41,17 +43,24 @@
 #define SOIL_WET      0       // Analog value when soil is completely wet
 
 
+// ############### WIFI AND SERVER CONFIG ###############
+const char* ssid       = "MonaConnect";
+const char* password   = "";
+const char* serverURL  = "http://172.16.192.42:8080/api/update";
+const char* studentID  = "620162191";
+
+
 // ############### COLOUR DEFINITIONS ###############
 #define BACKGROUND    ILI9341_BLACK
-#define HEADER_BG     0x1B4F  // Dark blue
-#define CARD_BG       0x2104  // Dark grey
+#define HEADER_BG     0x1B4F
+#define CARD_BG       0x2104
 #define TEXT_WHITE    ILI9341_WHITE
 #define TEXT_CYAN     ILI9341_CYAN
 #define TEXT_YELLOW   ILI9341_YELLOW
 #define TEXT_GREEN    ILI9341_GREEN
 #define TEXT_RED      ILI9341_RED
-#define TEXT_ORANGE   0xFD20  // Orange
-#define ACCENT        0x055F  // Teal
+#define TEXT_ORANGE   0xFD20
+#define ACCENT        0x055F
 
 
 // ############### OBJECTS ###############
@@ -74,12 +83,17 @@ float prevPressure      = -999;
 float prevHeatIndex     = -999;
 int   prevSoilPercent   = -999;
 
+unsigned long lastSendTime = 0;
+const unsigned long sendInterval = 10000; // Send data every 10 seconds
+
 
 // ############### FUNCTION DECLARATIONS ###############
 void drawUI(void);
 void drawHeader(void);
 void updateSensorValues(void);
 void updateDisplay(void);
+void sendDataToServer(void);
+void connectWiFi(void);
 String getSoilStatus(int percent);
 uint16_t getSoilColor(int percent);
 uint16_t getTempColor(float temp);
@@ -99,6 +113,7 @@ void setup() {
 
     // INIT DHT22
     dht.begin();
+    delay(2000);
     Serial.println("DHT22 Initialized");
 
     // INIT BMP280
@@ -122,6 +137,9 @@ void setup() {
     // CONFIGURE SOIL MOISTURE PIN
     pinMode(SOIL_PIN, INPUT);
 
+    // CONNECT TO WIFI
+    connectWiFi();
+
     // DRAW INITIAL UI
     drawUI();
 
@@ -137,11 +155,71 @@ void loop() {
     // UPDATE DISPLAY WITH NEW VALUES
     updateDisplay();
 
+    // SEND DATA TO SERVER EVERY 10 SECONDS
+    if (millis() - lastSendTime >= sendInterval) {
+        sendDataToServer();
+        lastSendTime = millis();
+    }
+
     // PRINT TO SERIAL FOR DEBUGGING
     Serial.printf("Temp: %.1f C  Humidity: %.1f%%  Pressure: %.1f hPa  HeatIndex: %.1f C  Soil: %d%%\n",
         temperature, humidity, pressure, heatIndex, soilPercent);
 
     delay(2000);
+}
+
+
+// ############### CONNECT TO WIFI ###############
+void connectWiFi() {
+    Serial.printf("\nConnecting to %s\n", ssid);
+    WiFi.begin(ssid, password);
+
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+        delay(500);
+        Serial.print(".");
+        attempts++;
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("\nWiFi Connected! IP: %s\n", WiFi.localIP().toString().c_str());
+    } else {
+        Serial.println("\nWiFi Connection Failed! Running without network.");
+    }
+}
+
+
+// ############### SEND DATA TO SERVER ###############
+void sendDataToServer() {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi not connected. Skipping data send.");
+        return;
+    }
+
+    WiFiClient client;
+    HTTPClient http;
+
+    http.begin(client, serverURL);
+    http.addHeader("Content-Type", "application/json");
+
+    // BUILD JSON PAYLOAD
+    char payload[256];
+    snprintf(payload, sizeof(payload),
+        "{\"id\":\"%s\",\"type\":\"sensor\",\"temperature\":%.2f,\"humidity\":%.2f,\"pressure\":%.2f,\"heatindex\":%.2f,\"soil\":%d}",
+        studentID, temperature, humidity, pressure, heatIndex, soilPercent);
+
+    Serial.printf("Sending: %s\n", payload);
+
+    int responseCode = http.POST(payload);
+
+    if (responseCode > 0) {
+        String response = http.getString();
+        Serial.printf("Server Response (%d): %s\n", responseCode, response.c_str());
+    } else {
+        Serial.printf("HTTP Error: %d\n", responseCode);
+    }
+
+    http.end();
 }
 
 
@@ -151,12 +229,12 @@ void updateSensorValues() {
     float newTemp = dht.readTemperature();
     float newHum  = dht.readHumidity();
 
-    if (!isnan(newTemp)) temperature = newTemp;
-    if (!isnan(newHum))  humidity    = newHum;
-
-    // CALCULATE HEAT INDEX
-    if (!isnan(temperature) && !isnan(humidity)) {
-        heatIndex = dht.computeHeatIndex(temperature, humidity, false);
+    if (isnan(newTemp) || isnan(newHum)) {
+        Serial.println("DHT22: Failed to read! Check wiring and pull-up resistor.");
+    } else {
+        temperature = newTemp;
+        humidity    = newHum;
+        heatIndex   = dht.computeHeatIndex(temperature, humidity, false);
     }
 
     // READ BMP280
@@ -173,32 +251,23 @@ void updateSensorValues() {
 // ############### DRAW FULL UI LAYOUT ###############
 void drawUI() {
     tft.fillScreen(BACKGROUND);
-
-    // DRAW HEADER
     drawHeader();
 
-    // DRAW SENSOR CARDS
-    // Temperature
     tft.fillRoundRect(5, 75, 230, 50, 6, CARD_BG);
     tft.drawRoundRect(5, 75, 230, 50, 6, TEXT_CYAN);
 
-    // Humidity
     tft.fillRoundRect(5, 133, 230, 50, 6, CARD_BG);
     tft.drawRoundRect(5, 133, 230, 50, 6, TEXT_CYAN);
 
-    // Pressure
     tft.fillRoundRect(5, 191, 230, 50, 6, CARD_BG);
     tft.drawRoundRect(5, 191, 230, 50, 6, TEXT_CYAN);
 
-    // Heat Index
     tft.fillRoundRect(5, 249, 110, 50, 6, CARD_BG);
     tft.drawRoundRect(5, 249, 110, 50, 6, TEXT_CYAN);
 
-    // Soil Moisture
     tft.fillRoundRect(125, 249, 110, 50, 6, CARD_BG);
     tft.drawRoundRect(125, 249, 110, 50, 6, TEXT_CYAN);
 
-    // DRAW CARD LABELS
     tft.setFont(&FreeSansBold9pt7b);
     tft.setTextSize(1);
 
@@ -243,7 +312,6 @@ void updateDisplay() {
     tft.setFont(&FreeSansBold9pt7b);
     tft.setTextSize(1);
 
-    // UPDATE TEMPERATURE
     if (temperature != prevTemperature) {
         tft.fillRect(10, 96, 220, 22, CARD_BG);
         tft.setTextColor(getTempColor(temperature));
@@ -252,7 +320,6 @@ void updateDisplay() {
         prevTemperature = temperature;
     }
 
-    // UPDATE HUMIDITY
     if (humidity != prevHumidity) {
         tft.fillRect(10, 154, 220, 22, CARD_BG);
         tft.setTextColor(getHumidityColor(humidity));
@@ -261,7 +328,6 @@ void updateDisplay() {
         prevHumidity = humidity;
     }
 
-    // UPDATE PRESSURE
     if (pressure != prevPressure) {
         tft.fillRect(10, 212, 220, 22, CARD_BG);
         tft.setTextColor(TEXT_YELLOW);
@@ -270,7 +336,6 @@ void updateDisplay() {
         prevPressure = pressure;
     }
 
-    // UPDATE HEAT INDEX
     if (heatIndex != prevHeatIndex) {
         tft.fillRect(10, 270, 100, 22, CARD_BG);
         tft.setTextColor(TEXT_ORANGE);
@@ -279,7 +344,6 @@ void updateDisplay() {
         prevHeatIndex = heatIndex;
     }
 
-    // UPDATE SOIL MOISTURE
     if (soilPercent != prevSoilPercent) {
         tft.fillRect(130, 270, 100, 22, CARD_BG);
         tft.setTextColor(getSoilColor(soilPercent));
